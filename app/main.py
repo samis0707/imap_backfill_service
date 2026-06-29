@@ -181,11 +181,35 @@ def _body_text(parsed) -> str:
     return body[:MAX_BODY_CHARS]
 
 
+def _resolve_ipv4(host: str, port: int) -> str:
+    import socket
+    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    if not infos:
+        raise HTTPException(status_code=502, detail=f"No IPv4 address for {host}")
+    return infos[0][4][0]
+
+
 def _connect() -> IMAPClient:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
         raise HTTPException(status_code=500, detail="IMAP credentials not configured")
-    client = IMAPClient(IMAP_HOST, port=IMAP_PORT, use_uid=True, ssl=True)
-    client.login(IMAP_USER, IMAP_PASS)
+
+    import socket
+    # Docker bridge networks usually have no IPv6 egress. imaplib may pick the
+    # AAAA record -> OSError 101 "Network is unreachable". We force IPv4 only
+    # for the duration of this connect by filtering getaddrinfo to AF_INET,
+    # while keeping IMAP_HOST as the connect target so TLS/SNI still validates
+    # against the real certificate hostname.
+    _orig_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = _ipv4_only
+    try:
+        client = IMAPClient(IMAP_HOST, port=IMAP_PORT, use_uid=True, ssl=True)
+        client.login(IMAP_USER, IMAP_PASS)
+    finally:
+        socket.getaddrinfo = _orig_getaddrinfo
     return client
 
 
