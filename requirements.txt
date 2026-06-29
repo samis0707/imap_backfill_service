@@ -1,0 +1,6 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+IMAPClient==3.0.1
+mail-parser==4.1.4
+pypdf==5.1.0
+python-docx==1.1.2

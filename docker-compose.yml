@@ -1,0 +1,23 @@
+services:
+  imap-service:
+    build: .
+    # In Coolify, set these in the service's Environment Variables tab.
+    # Do NOT commit real values to git.
+    environment:
+      IMAP_HOST: ${IMAP_HOST}
+      IMAP_PORT: ${IMAP_PORT:-993}
+      IMAP_USER: ${IMAP_USER}
+      IMAP_PASS: ${IMAP_PASS}
+      IMAP_SERVICE_TOKEN: ${IMAP_SERVICE_TOKEN}
+      MAX_BODY_CHARS: ${MAX_BODY_CHARS:-8000}
+      MAX_ATTACH_CHARS: ${MAX_ATTACH_CHARS:-12000}
+      MAX_ATTACH_BYTES: ${MAX_ATTACH_BYTES:-20971520}
+    expose:
+      - "8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8080/health').status==200 else sys.exit(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
