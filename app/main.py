@@ -1,7 +1,7 @@
 """
 IMAP → JSON microservice for n8n RAG ingestion.
 
-Replaces the imapflow Code node. Exposes two read endpoints:
+Replaces the imapflow Code node. Exposes read endpoints:
 
   GET  /health
   POST /fetch          -> paginated bulk backfill (offset/limit) OR incremental (since_uid)
@@ -17,6 +17,11 @@ Design notes:
   only. Keeps memory bounded regardless of mailbox size.
 - Attachment text extraction (PDF/DOCX) is best-effort and never fatal: a
   corrupt PDF degrades to an empty attachment_text, the email still indexes.
+- Cross-folder backfill: pass mailbox="*" (or omit it). The service lists all
+  folders, sorts them deterministically, and resolves a GLOBAL offset across
+  the concatenated (folder, uid) sequence. This keeps n8n pagination at a
+  single offset cursor. message_id stays the dedup key (globally unique),
+  so re-runs and overlap across folders dedup correctly in Qdrant.
 """
 
 from __future__ import annotations
@@ -44,16 +49,26 @@ MAX_BODY_CHARS = int(os.environ.get("MAX_BODY_CHARS", "8000"))
 MAX_ATTACH_CHARS = int(os.environ.get("MAX_ATTACH_CHARS", "12000"))
 MAX_ATTACH_BYTES = int(os.environ.get("MAX_ATTACH_BYTES", str(20 * 1024 * 1024)))
 
-app = FastAPI(title="IMAP RAG service", version="1.0.0")
+# Folders to skip when iterating "*". Comma-separated, matched case-insensitive
+# against the folder name. Default: skip Trash/Spam/Junk/Drafts. Keep Sent.
+SKIP_FOLDERS = [
+    s.strip().lower()
+    for s in os.environ.get("SKIP_FOLDERS", "trash,papierkorb,spam,junk,drafts,entwürfe").split(",")
+    if s.strip()
+]
+
+app = FastAPI(title="IMAP RAG service", version="1.1.0")
 
 
 # --- models -----------------------------------------------------------------
 class FetchRequest(BaseModel):
+    # mailbox "*" or "" -> iterate ALL folders (global offset across folders)
     mailbox: str = Field(default="INBOX")
     # bulk backfill
     offset: int = Field(default=0, ge=0)
     limit: int = Field(default=50, ge=1, le=500)
     # incremental: only messages with UID strictly greater than this
+    # NOTE: incremental mode is single-folder only (UIDs are per-folder).
     since_uid: Optional[int] = Field(default=None, ge=0)
     # include extracted attachment text
     with_attachments: bool = Field(default=True)
@@ -61,6 +76,7 @@ class FetchRequest(BaseModel):
 
 class EmailItem(BaseModel):
     uid: int
+    folder: str
     message_id: str
     subject: str
     from_: str = Field(alias="from")
@@ -77,17 +93,16 @@ class EmailItem(BaseModel):
 
 class FetchResponse(BaseModel):
     mailbox: str
-    total: int  # total matching messages in mailbox (for pagination math)
+    total: int  # total matching messages across the selected folder(s)
     returned: int
     next_offset: Optional[int]  # null when no more pages (offset mode)
-    max_uid: Optional[int]  # highest UID in this page (for incremental cursor)
+    max_uid: Optional[int]  # highest UID in this page (incremental cursor, single-folder)
     items: list[EmailItem]
 
 
 # --- auth -------------------------------------------------------------------
 def _check_auth(authorization: Optional[str]) -> None:
     if not SERVICE_TOKEN:
-        # If no token configured, refuse rather than run open.
         raise HTTPException(status_code=500, detail="IMAP_SERVICE_TOKEN not configured")
     expected = f"Bearer {SERVICE_TOKEN}"
     if authorization != expected:
@@ -133,7 +148,6 @@ def _attachment_text(parsed) -> tuple[str, list[str]]:
         try:
             raw = payload if isinstance(payload, (bytes, bytearray)) else payload.encode("latin-1")
             if not binary:
-                # mailparser sometimes returns base64 string payloads
                 import base64
                 try:
                     raw = base64.b64decode(payload)
@@ -151,7 +165,7 @@ def _attachment_text(parsed) -> tuple[str, list[str]]:
         elif low.endswith(".docx"):
             text = _extract_docx(raw)
         else:
-            continue  # only PDF/DOCX per requirement
+            continue
         if text:
             names.append(filename)
             chunks.append(f"--- {filename} ---\n{text}")
@@ -161,7 +175,6 @@ def _attachment_text(parsed) -> tuple[str, list[str]]:
 
 # --- helpers ----------------------------------------------------------------
 def _addr_list(parsed_field) -> str:
-    # mailparser returns list of [name, address] pairs
     out = []
     for entry in parsed_field or []:
         if isinstance(entry, (list, tuple)) and len(entry) == 2:
@@ -181,24 +194,13 @@ def _body_text(parsed) -> str:
     return body[:MAX_BODY_CHARS]
 
 
-def _resolve_ipv4(host: str, port: int) -> str:
-    import socket
-    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-    if not infos:
-        raise HTTPException(status_code=502, detail=f"No IPv4 address for {host}")
-    return infos[0][4][0]
-
-
 def _connect() -> IMAPClient:
     if not (IMAP_HOST and IMAP_USER and IMAP_PASS):
         raise HTTPException(status_code=500, detail="IMAP credentials not configured")
 
     import socket
-    # Docker bridge networks usually have no IPv6 egress. imaplib may pick the
-    # AAAA record -> OSError 101 "Network is unreachable". We force IPv4 only
-    # for the duration of this connect by filtering getaddrinfo to AF_INET,
-    # while keeping IMAP_HOST as the connect target so TLS/SNI still validates
-    # against the real certificate hostname.
+    # Docker bridge networks usually have no IPv6 egress. Force IPv4 only for
+    # the duration of connect while keeping IMAP_HOST as the TLS/SNI target.
     _orig_getaddrinfo = socket.getaddrinfo
 
     def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
@@ -211,6 +213,54 @@ def _connect() -> IMAPClient:
     finally:
         socket.getaddrinfo = _orig_getaddrinfo
     return client
+
+
+def _list_backfill_folders(client) -> list[str]:
+    """All selectable folders, deterministically sorted, skip-list applied."""
+    folders = []
+    for flags, delimiter, name in client.list_folders():
+        # \Noselect folders cannot be opened (container nodes) -> skip
+        flag_names = {
+            (f.decode().lower() if isinstance(f, bytes) else str(f).lower())
+            for f in (flags or [])
+        }
+        if "\\noselect" in flag_names:
+            continue
+        if name.lower() in SKIP_FOLDERS:
+            continue
+        folders.append(name)
+    # deterministic order so a global offset stays stable across pages
+    folders.sort()
+    return folders
+
+
+def _parse_one(uid: int, folder: str, raw: bytes, with_attachments: bool) -> Optional[EmailItem]:
+    try:
+        parsed = mailparser.parse_from_bytes(raw)
+    except Exception as e:
+        log.warning("parse failed folder=%s uid=%s: %s", folder, uid, e)
+        return None
+
+    att_text, att_names = ("", [])
+    if with_attachments:
+        att_text, att_names = _attachment_text(parsed)
+
+    msg_id = (parsed.message_id or "").strip() or f"{folder}:{uid}"
+    date_iso = parsed.date.isoformat() if parsed.date else None
+
+    return EmailItem(
+        uid=uid,
+        folder=folder,
+        message_id=msg_id,
+        subject=(parsed.subject or "").strip(),
+        **{"from": _addr_list(parsed.from_)},
+        to=_addr_list(parsed.to),
+        cc=_addr_list(parsed.cc),
+        date=date_iso,
+        body=_body_text(parsed),
+        attachment_text=att_text,
+        attachment_names=att_names,
+    )
 
 
 # --- endpoints --------------------------------------------------------------
@@ -236,70 +286,106 @@ def mailboxes(authorization: Optional[str] = Header(default=None)):
 @app.post("/fetch", response_model=FetchResponse)
 def fetch(req: FetchRequest, authorization: Optional[str] = Header(default=None)):
     _check_auth(authorization)
+
+    all_folders_mode = (req.mailbox or "").strip() in ("", "*")
+
+    # incremental is single-folder only
+    if req.since_uid is not None and all_folders_mode:
+        raise HTTPException(
+            status_code=400,
+            detail="since_uid (incremental) requires a single mailbox; '*' not allowed",
+        )
+
     client = _connect()
     try:
-        client.select_folder(req.mailbox, readonly=True)
-
-        # Determine the candidate UID set.
+        # ---- single-folder incremental (unchanged behaviour) --------------
         if req.since_uid is not None:
-            # incremental: UID range search, strictly greater handled by slicing
+            client.select_folder(req.mailbox, readonly=True)
             uids = client.search([u"UID", f"{req.since_uid + 1}:*"])
-            # IMAP "n:*" can echo the last UID even if none are greater; filter.
-            uids = [u for u in uids if u > req.since_uid]
-        else:
-            uids = client.search(["ALL"])
-
-        uids = sorted(uids)
-        total = len(uids)
-
-        if req.since_uid is not None:
+            uids = sorted(u for u in uids if u > req.since_uid)
+            total = len(uids)
             page_uids = uids[: req.limit]
-            next_offset = None
+            items: list[EmailItem] = []
+            max_uid: Optional[int] = None
+            if page_uids:
+                resp = client.fetch(page_uids, ["RFC822"])
+                for uid in page_uids:
+                    raw = resp.get(uid, {}).get(b"RFC822")
+                    if not raw:
+                        continue
+                    it = _parse_one(uid, req.mailbox, raw, req.with_attachments)
+                    if it:
+                        items.append(it)
+                    max_uid = uid if max_uid is None else max(max_uid, uid)
+            return FetchResponse(
+                mailbox=req.mailbox, total=total, returned=len(items),
+                next_offset=None, max_uid=max_uid, items=items,
+            )
+
+        # ---- offset backfill ----------------------------------------------
+        # Build the folder list to traverse.
+        if all_folders_mode:
+            folders = _list_backfill_folders(client)
         else:
-            page_uids = uids[req.offset : req.offset + req.limit]
-            consumed = req.offset + len(page_uids)
-            next_offset = consumed if consumed < total else None
+            folders = [req.mailbox]
 
-        items: list[EmailItem] = []
-        max_uid: Optional[int] = None
+        # First pass: count per folder (cheap ENVELOPE-less UID search) so we
+        # can map a global offset onto (folder, local_slice).
+        folder_uids: list[tuple[str, list[int]]] = []
+        total = 0
+        for folder in folders:
+            try:
+                client.select_folder(folder, readonly=True)
+            except Exception as e:
+                log.warning("select failed folder=%s: %s", folder, e)
+                continue
+            uids = sorted(client.search(["ALL"]))
+            folder_uids.append((folder, uids))
+            total += len(uids)
 
-        if page_uids:
+        # Walk folders accumulating a virtual global index until we reach the
+        # requested offset window [offset, offset+limit).
+        window_start = req.offset
+        window_end = req.offset + req.limit
+        items = []
+        max_uid = None
+        cursor = 0  # global index of the first uid in the current folder
+
+        for folder, uids in folder_uids:
+            f_count = len(uids)
+            f_start_global = cursor
+            f_end_global = cursor + f_count
+            cursor = f_end_global
+
+            # does this folder overlap the requested window?
+            if f_end_global <= window_start:
+                continue  # entirely before the window
+            if f_start_global >= window_end:
+                break  # entirely after the window -> done
+
+            local_start = max(0, window_start - f_start_global)
+            local_end = min(f_count, window_end - f_start_global)
+            page_uids = uids[local_start:local_end]
+            if not page_uids:
+                continue
+
+            client.select_folder(folder, readonly=True)
             resp = client.fetch(page_uids, ["RFC822"])
             for uid in page_uids:
                 raw = resp.get(uid, {}).get(b"RFC822")
                 if not raw:
                     continue
-                try:
-                    parsed = mailparser.parse_from_bytes(raw)
-                except Exception as e:
-                    log.warning("parse failed uid=%s: %s", uid, e)
-                    continue
-
-                att_text, att_names = ("", [])
-                if req.with_attachments:
-                    att_text, att_names = _attachment_text(parsed)
-
-                msg_id = (parsed.message_id or "").strip() or str(uid)
-                date_iso = parsed.date.isoformat() if parsed.date else None
-
-                items.append(
-                    EmailItem(
-                        uid=uid,
-                        message_id=msg_id,
-                        subject=(parsed.subject or "").strip(),
-                        **{"from": _addr_list(parsed.from_)},
-                        to=_addr_list(parsed.to),
-                        cc=_addr_list(parsed.cc),
-                        date=date_iso,
-                        body=_body_text(parsed),
-                        attachment_text=att_text,
-                        attachment_names=att_names,
-                    )
-                )
+                it = _parse_one(uid, folder, raw, req.with_attachments)
+                if it:
+                    items.append(it)
                 max_uid = uid if max_uid is None else max(max_uid, uid)
 
+        consumed = req.offset + len(items)
+        # next_offset based on TOTAL across all traversed folders.
+        next_offset = window_end if window_end < total else None
+
         return FetchResponse(
-            mailbox=req.mailbox,
+            mailbox=("*" if all_folders_mode else req.mailbox),
             total=total,
             returned=len(items),
             next_offset=next_offset,
