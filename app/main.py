@@ -62,15 +62,11 @@ app = FastAPI(title="IMAP RAG service", version="1.1.0")
 
 # --- models -----------------------------------------------------------------
 class FetchRequest(BaseModel):
-    # mailbox "*" or "" -> iterate ALL folders (global offset across folders)
     mailbox: str = Field(default="INBOX")
-    # bulk backfill
-    offset: int = Field(default=0, ge=0)
+    offset: int = Field(default=0, ge=0)          # lokaler Offset INNERHALB des aktuellen Ordners
+    folder_index: int = Field(default=0, ge=0)    # welcher Ordner (Index in der sortierten Liste)
     limit: int = Field(default=50, ge=1, le=500)
-    # incremental: only messages with UID strictly greater than this
-    # NOTE: incremental mode is single-folder only (UIDs are per-folder).
     since_uid: Optional[int] = Field(default=None, ge=0)
-    # include extracted attachment text
     with_attachments: bool = Field(default=True)
 
 
@@ -93,10 +89,14 @@ class EmailItem(BaseModel):
 
 class FetchResponse(BaseModel):
     mailbox: str
-    total: int  # total matching messages across the selected folder(s)
+    folder: Optional[str]            # welcher Ordner gerade verarbeitet wurde
+    folder_index: int
+    folder_total: int                # Mails im aktuellen Ordner
     returned: int
-    next_offset: Optional[int]  # null when no more pages (offset mode)
-    max_uid: Optional[int]  # highest UID in this page (incremental cursor, single-folder)
+    next_offset: Optional[int]       # nächster lokaler Offset, oder null
+    next_folder_index: Optional[int] # nächster Ordner-Index, oder null wenn fertig
+    done: bool                       # true = alle Ordner durch
+    max_uid: Optional[int]
     items: list[EmailItem]
 
 
@@ -322,54 +322,32 @@ def fetch(req: FetchRequest, authorization: Optional[str] = Header(default=None)
                 next_offset=None, max_uid=max_uid, items=items,
             )
 
-        # ---- offset backfill ----------------------------------------------
-        # Build the folder list to traverse.
+# ---- offset backfill, EIN Ordner pro Aufruf -----------------------
         if all_folders_mode:
             folders = _list_backfill_folders(client)
         else:
             folders = [req.mailbox]
 
-        # First pass: count per folder (cheap ENVELOPE-less UID search) so we
-        # can map a global offset onto (folder, local_slice).
-        folder_uids: list[tuple[str, list[int]]] = []
-        total = 0
-        for folder in folders:
-            try:
-                client.select_folder(folder, readonly=True)
-            except Exception as e:
-                log.warning("select failed folder=%s: %s", folder, e)
-                continue
-            uids = sorted(client.search(["ALL"]))
-            folder_uids.append((folder, uids))
-            total += len(uids)
+        # Sind wir über das Ende aller Ordner hinaus? -> fertig
+        if req.folder_index >= len(folders):
+            return FetchResponse(
+                mailbox=("*" if all_folders_mode else req.mailbox),
+                folder=None, folder_index=req.folder_index,
+                folder_total=0, returned=0,
+                next_offset=None, next_folder_index=None,
+                done=True, max_uid=None, items=[],
+            )
 
-        # Walk folders accumulating a virtual global index until we reach the
-        # requested offset window [offset, offset+limit).
-        window_start = req.offset
-        window_end = req.offset + req.limit
-        items = []
-        max_uid = None
-        cursor = 0  # global index of the first uid in the current folder
+        folder = folders[req.folder_index]
+        client.select_folder(folder, readonly=True)
+        uids = sorted(client.search(["ALL"]))   # nur EIN SEARCH, nur dieser Ordner
+        folder_total = len(uids)
 
-        for folder, uids in folder_uids:
-            f_count = len(uids)
-            f_start_global = cursor
-            f_end_global = cursor + f_count
-            cursor = f_end_global
+        page_uids = uids[req.offset : req.offset + req.limit]
 
-            # does this folder overlap the requested window?
-            if f_end_global <= window_start:
-                continue  # entirely before the window
-            if f_start_global >= window_end:
-                break  # entirely after the window -> done
-
-            local_start = max(0, window_start - f_start_global)
-            local_end = min(f_count, window_end - f_start_global)
-            page_uids = uids[local_start:local_end]
-            if not page_uids:
-                continue
-
-            client.select_folder(folder, readonly=True)
+        items: list[EmailItem] = []
+        max_uid: Optional[int] = None
+        if page_uids:
             resp = client.fetch(page_uids, ["RFC822"])
             for uid in page_uids:
                 raw = resp.get(uid, {}).get(b"RFC822")
@@ -380,15 +358,31 @@ def fetch(req: FetchRequest, authorization: Optional[str] = Header(default=None)
                     items.append(it)
                 max_uid = uid if max_uid is None else max(max_uid, uid)
 
-        consumed = req.offset + len(items)
-        # next_offset based on TOTAL across all traversed folders.
-        next_offset = window_end if window_end < total else None
+        # Cursor weiterschalten:
+        consumed_in_folder = req.offset + len(page_uids)
+        if consumed_in_folder < folder_total:
+            # gleicher Ordner, nächste Seite
+            next_offset = consumed_in_folder
+            next_folder_index = req.folder_index
+            done = False
+        else:
+            # Ordner fertig -> nächster Ordner ab Offset 0
+            next_offset = 0
+            next_folder_index = req.folder_index + 1
+            done = next_folder_index >= len(folders)
+            if done:
+                next_offset = None
+                next_folder_index = None
 
         return FetchResponse(
             mailbox=("*" if all_folders_mode else req.mailbox),
-            total=total,
+            folder=folder,
+            folder_index=req.folder_index,
+            folder_total=folder_total,
             returned=len(items),
             next_offset=next_offset,
+            next_folder_index=next_folder_index,
+            done=done,
             max_uid=max_uid,
             items=items,
         )
